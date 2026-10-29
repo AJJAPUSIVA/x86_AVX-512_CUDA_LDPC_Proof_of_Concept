@@ -2,6 +2,36 @@
 
 This source archive is based on the existing `GPU_LDPC_CPP_CUDA_Source` project. It contains a **separate CPU research decoder**, not a CUDA CPU fallback. The CUDA path remains device-only for LDPC coding and decoding.
 
+## Backend topology
+
+```mermaid
+flowchart TB
+    Inputs["QC matrix + input LLRs"] --> Cpu["CPU research backend"]
+    Inputs --> Cuda["CUDA device backend"]
+
+    subgraph CPU["Host memory · C++20"]
+        Cpu --> Choice{"AVX-512F runtime support?"}
+        Choice -->|Yes| Lanes["AVX-512<br/>16-codeword lanes"]
+        Choice -->|No| Ref["Scalar reference"]
+        Lanes --> CpuDecode["Layered normalized min-sum"]
+        Ref --> CpuDecode
+        CpuDecode --> CpuSyndrome["Full binary syndrome"]
+    end
+
+    subgraph GPU["CUDA device memory · sm_89"]
+        Cuda --> DeviceMeta["Sparse QC metadata"]
+        DeviceMeta --> GpuEncode["GF(2) encoder"]
+        DeviceMeta --> GpuDecode["Layered normalized min-sum"]
+        GpuEncode --> GpuSyndrome["Syndrome kernel"]
+        GpuDecode --> GpuSyndrome
+    end
+
+    CpuSyndrome --> CpuOut["Host decoded bits"]
+    GpuSyndrome --> GpuOut["Device bits + validity"]
+```
+
+The two paths share the matrix convention and LLR sign convention, but they do not share execution state or silently dispatch between host and device.
+
 ## Branch strategy
 
 - `feature/x86-avx512-decoder`: add `src/cpu_decoder.cpp`, `include/nrldpc/cpu_decoder.hpp`, `tests/test_cpu.cpp`, `benchmarks/benchmark_cpu.cpp`, and the CMake build switch. On x86-64 GCC/Clang with AVX-512F, it decodes 16 independent codewords concurrently using AVX-512, with layered normalized min-sum and prefix/suffix minimum reuse. Scalar reference is for correctness and non-AVX build sanity checking, **not** a fallback used by GPU decoding.
@@ -39,3 +69,50 @@ ctest --test-dir build-cuda --output-on-failure
 ## Technical detail
 
 Both implementations operate on non-packed bits and LLR = log(P(bit=0) / P(bit=1)). The CPU decoder uses a sparse edge list derived from the QC exponent matrix, preserves layer order, and checks the full binary syndrome before stopping. The AVX-512F path vectorizes across 16 codewords; sign parity is accumulated with AVX-512 compare masks and the edge-excluding minimum comes from prefix/suffix arrays.
+
+### CPU decoder flow
+
+```mermaid
+flowchart TB
+    Batch["Batch of float LLRs"] --> Layout["Transpose to variable-node × 16 lanes"]
+    Layout --> Layer["Process QC layer in order"]
+    Layer --> Q["Extrinsic q = L − message"]
+    Q --> Min["Prefix / suffix minima"]
+    Q --> Sign["AVX-512 sign masks"]
+    Min --> Update["Normalized message update"]
+    Sign --> Update
+    Update --> Hard["Hard decisions per active lane"]
+    Hard --> Syndrome{"All syndromes zero?"}
+    Syndrome -->|No| Layer
+    Syndrome -->|Yes| Output["Decoded host bytes"]
+```
+
+The scalar implementation follows the same layered update and stopping rule one codeword at a time. It is a correctness reference and portability path, not evidence of AVX-512 throughput.
+
+### CUDA codec flow
+
+```mermaid
+flowchart TB
+    Host["Host C++ control"] --> Copy["QC metadata + device buffers"]
+    Copy --> Stream["Caller-owned CUDA stream"]
+    Stream --> Enc["encode_gauss<br/>one CTA per codeword"]
+    Stream --> Dec["decode_layered<br/>one CTA per codeword"]
+    Enc --> Check["check_kernel"]
+    Dec --> Check
+    Check --> Device["Device output + validity"]
+```
+
+Allocation and kernel launches are asynchronous where supported. Device pointer lifetime and stream synchronization remain the caller's responsibility.
+
+### Validation path
+
+```mermaid
+flowchart TB
+    Toy["Current: toy QC smoke tests"] --> Golden["Next: NR BG1/BG2 golden vectors"]
+    Golden --> Channel["AWGN + BLER / FER validation"]
+    Channel --> Compare["Matched CPU / GPU policy"]
+    Compare --> Hardware["Hardware throughput and profiling"]
+    Hardware --> Production["Production-readiness claim"]
+```
+
+Only the first stage is represented by the bundled matrix and repository tests. Performance and 5G NR compliance claims require every later stage under controlled, reproducible conditions.

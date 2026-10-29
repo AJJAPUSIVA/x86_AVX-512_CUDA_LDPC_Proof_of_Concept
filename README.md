@@ -1,21 +1,63 @@
-# GPU-only C++20/CUDA QC-LDPC prototype (RTX 4090)
+# x86 AVX-512 + CUDA QC-LDPC proof of concept
 
 Reference benchmark project: https://github.com/rcbarke/six-times-to-spare
 
 **STATUS: source prototype, NOT a validated 3GPP-compliant production 5G NR codec.**
-No CPU LDPC fallback exists. Encoding (GPU GF(2) elimination), decoding (GPU layered normalized min-sum) and syndrome checking are CUDA kernels. Host C++ only loads QC matrices and controls CUDA memory/launches.
+The repository contains two independent research backends: a CPU decoder with scalar and AVX-512F implementations, and a CUDA device codec for an RTX 4090. The CPU backend is not a fallback for the CUDA codec; each backend has its own build targets, tests, and benchmark.
+
+## Architecture at a glance
+
+```mermaid
+flowchart TB
+    Matrix["QC exponent matrix<br/>rows · cols · kb · Z"] --> CpuLoad["CPU matrix loader"]
+    Matrix --> GpuLoad["CUDA matrix loader"]
+    Build["CMake build options"] -->|"NRLDPC_ENABLE_CPU"| CpuLib["nrldpc_cpu"]
+    Build -->|"NRLDPC_ENABLE_CUDA"| GpuLib["nrldpc + CUDA runtime"]
+    CpuLoad --> CpuLib
+    GpuLoad --> GpuLib
+
+    CpuLib --> Detect{"AVX-512F available?"}
+    Detect -->|Yes| Avx["16 codewords in lockstep"]
+    Detect -->|No| Scalar["Scalar correctness path"]
+    Avx --> CpuCheck["CPU syndrome check"]
+    Scalar --> CpuCheck
+
+    GpuLib --> Encode["GPU GF(2) encoder"]
+    GpuLib --> Decode["GPU layered min-sum decoder"]
+    Encode --> GpuCheck["GPU syndrome kernel"]
+    Decode --> GpuCheck
+
+    CpuCheck --> Result["Decoded bits / validity"]
+    GpuCheck --> Result
+```
+
+The common input is the QC exponent matrix, but execution and memory ownership remain backend-specific. See [docs/POC.md](docs/POC.md) for detailed CPU lane, CUDA device, and validation flows.
 
 ## Required environment
-- NVIDIA RTX 4090 (Ada, `sm_89`), CUDA toolkit with C++20 support, CMake 3.24+, Linux C++ compiler.
-- No CUDA device => hard failure. This environment cannot compile or execute CUDA; tests must be executed on real GPU.
+
+- **CPU research path:** CMake 3.24+ and a C++20 compiler. AVX-512F requires supported x86-64 hardware and OS support; other machines use the scalar correctness path.
+- **CUDA device path:** NVIDIA RTX 4090 (Ada, `sm_89`), a CUDA toolkit with C++20 support, and a Linux C++ compiler. The CUDA targets require a CUDA device and do not fall back to the CPU backend.
 
 ## Build and test
+
+CPU-only development build:
+
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89
-cmake --build build -j
-ctest --test-dir build --output-on-failure
-./build/ldpc_bench matrices/toy_qc_z4.txt 32 10
+cmake -S . -B build-cpu -DNRLDPC_ENABLE_CPU=ON -DNRLDPC_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu -j
+ctest --test-dir build-cpu --output-on-failure
+./build-cpu/ldpc_cpu_bench matrices/toy_qc_z4.txt 256 10
 ```
+
+RTX 4090 CUDA build:
+
+```bash
+cmake -S . -B build-cuda -DNRLDPC_ENABLE_CPU=OFF -DNRLDPC_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda -j
+ctest --test-dir build-cuda --output-on-failure
+./build-cuda/ldpc_bench matrices/toy_qc_z4.txt 32 10
+```
+
 To retrieve the original research repo on your own machine: `./tools/clone_reference.sh` (requires GitHub connectivity).
 
 ## QC matrix format
